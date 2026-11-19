@@ -1,49 +1,99 @@
 #!/usr/bin/env bash
-# 把当前目录（机制速查/）同步到 GitHub Pages 仓库并推送。
+# 把当前目录（机制速查/）同步到 GitHub Pages 仓库。
 #
 #   ./deploy.sh
 #
-# 首次使用需要能免密访问 github.com：gh 已登录即可（脚本用 gh 的凭证）。
+# 走 GitHub Contents API（经 gh），不依赖 git push 的凭证配置：
+# 只要 `gh auth status` 正常就能用。首次会先重跑 build.py。
 set -euo pipefail
+
+cd "$(dirname "$0")"
 
 REPO="easebreaker/gr-parallel-cheatsheet"
 URL="https://easebreaker.github.io/gr-parallel-cheatsheet/"
-SRC="$(cd "$(dirname "$0")" && pwd)"
-WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
 
-# 1) 先重新生成 index.html，避免推上去的是旧的
-if command -v python3 >/dev/null 2>&1; then
-  echo "==> 重新生成 index.html"
-  ( cd "$SRC" && python3 build.py )
-fi
+command -v gh >/dev/null || { echo "需要 gh：https://cli.github.com/"; exit 1; }
+gh auth status >/dev/null 2>&1 || { echo "请先 gh auth login"; exit 1; }
 
-# 2) 拉下远端
-echo "==> 克隆 $REPO"
-if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
-  GIT_AUTH=(-c "credential.helper=!gh auth git-credential")
-else
-  GIT_AUTH=()
-fi
-git "${GIT_AUTH[@]}" clone --depth 1 "https://github.com/${REPO}.git" "$WORK/r"
+echo "==> 重新生成 index.html"
+python3 build.py
 
-# 3) 同步（删除远端多余文件；保留 .git / .nojekyll）
-echo "==> 同步文件"
-rsync -a --delete \
-  --exclude '.git' --exclude '__pycache__' --exclude '.DS_Store' \
-  "$SRC"/ "$WORK/r"/
-touch "$WORK/r/.nojekyll"
+echo "==> 同步到 $REPO"
+REPO="$REPO" python3 - <<'PY'
+import base64, json, os, subprocess
 
-# 4) 提交并推送
-cd "$WORK/r"
-git add -A
-if git diff --cached --quiet; then
-  echo "没有变化，跳过推送。"
-else
-  git "${GIT_AUTH[@]}" \
-      -c user.name="$(git config --get user.name || echo deploy)" \
-      -c user.email="$(git config --get user.email || echo deploy@local)" \
-      commit -q -m "deploy: $(date '+%Y-%m-%d %H:%M')"
-  git "${GIT_AUTH[@]}" push -q origin HEAD:main
-  echo "==> 已推送。约 30 秒后生效：$URL"
-fi
+REPO = os.environ["REPO"]
+ROOT = os.path.dirname(os.path.abspath("build.py"))
+SKIP_DIRS = {".git", "__pycache__", ".github"}
+SKIP_FILES = {".DS_Store"}
+
+def gh(*args, **kw):
+    return subprocess.run(["gh", *args], text=True,
+                          capture_output=True, **kw)
+
+# 本地文件（相对路径 -> 绝对路径）
+local = {}
+for dirpath, dirnames, filenames in os.walk("."):
+    dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+    for fn in filenames:
+        if fn in SKIP_FILES or fn.endswith(".pyc"):
+            continue
+        full = os.path.join(dirpath, fn)
+        local[os.path.relpath(full, ".")] = full
+
+# 远端文件（path -> sha）
+r = gh("api", f"repos/{REPO}/git/trees/main?recursive=1", "-q",
+       '.tree[] | select(.type=="blob") | "\\(.path)\\t\\(.sha)"')
+remote = {}
+for line in (r.stdout or "").splitlines():
+    if "\t" in line:
+        path, sha = line.split("\t", 1)
+        remote[path] = sha
+
+added = updated = removed = 0
+
+for path, full in sorted(local.items()):
+    with open(full, "rb") as f:
+        raw = f.read()
+    content = base64.b64encode(raw).decode()
+
+    old = None
+    if path in remote:
+        # 比对远端大小，相同就跳过（省掉无意义的 commit）
+        q = gh("api", f"repos/{REPO}/contents/{path}", "-q", ".size")
+        try:
+            if int((q.stdout or "0").strip()) == len(raw) and path != "index.html":
+                continue
+        except ValueError:
+            pass
+        s = gh("api", f"repos/{REPO}/contents/{path}", "-q", ".sha")
+        old = (s.stdout or "").strip()
+
+    payload = {"message": f"deploy {path}", "content": content}
+    if old:
+        payload["sha"] = old
+    w = gh("api", "-X", "PUT", f"repos/{REPO}/contents/{path}",
+           "--input", "-", input=json.dumps(payload))
+    if w.returncode != 0:
+        print("  FAIL", path, (w.stderr or "").strip()[:120])
+        continue
+    if old:
+        updated += 1
+    else:
+        added += 1
+
+# 远端有、本地没有的 -> 删除
+for path, sha in sorted(remote.items()):
+    if path in local:
+        continue
+    w = gh("api", "-X", "DELETE", f"repos/{REPO}/contents/{path}", "--input", "-",
+           input=json.dumps({"message": f"delete {path}", "sha": sha}))
+    if w.returncode == 0:
+        removed += 1
+
+print(f"  新增 {added} / 更新 {updated} / 删除 {removed}")
+if added == updated == removed == 0:
+    print("  没有变化。")
+PY
+
+echo "==> 完成。约 30 秒后生效：$URL"
