@@ -57,15 +57,14 @@ for path, full in sorted(local.items()):
         raw = f.read()
     content = base64.b64encode(raw).decode()
 
+    # 用 git blob hash 精确比对：内容没变就完全不产生 commit
+    h = subprocess.run(["git", "hash-object", full], text=True, capture_output=True)
+    local_blob = (h.stdout or "").strip()
+    if path in remote and remote[path] == local_blob:
+        continue
+
     old = None
     if path in remote:
-        # 比对远端大小，相同就跳过（省掉无意义的 commit）
-        q = gh("api", f"repos/{REPO}/contents/{path}", "-q", ".size")
-        try:
-            if int((q.stdout or "0").strip()) == len(raw) and path != "index.html":
-                continue
-        except ValueError:
-            pass
         s = gh("api", f"repos/{REPO}/contents/{path}", "-q", ".sha")
         old = (s.stdout or "").strip()
 
